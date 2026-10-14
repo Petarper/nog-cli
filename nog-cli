@@ -1,0 +1,615 @@
+#!/usr/bin/env bash
+#
+# nog-cli - list rdaily.live sports matches, fuzzy-pick one, and resolve/open
+#           its broadcast ("Broadcast TV") stream link on iplayer.is.
+#
+# Pipeline (reverse-engineered from rdaily.live's main.js / match.js):
+#   1. Fetch the Flashscore day feed:
+#        https://1.newsoccers.one/2/x/feed/f_<sportId>_<dayOffset>_1_en_1
+#      and parse events (AA=id, AE=home, AF=away, AD=kickoff ts).
+#   2. User fuzzy-picks a match.
+#   3. Resolve broadcast links from the local override API:
+#        https://rdaily.live/api/v1/match/FS:<eventId>   -> custom_urls[]
+#      Each custom_urls[].url is a 32-hex token.
+#   4. Final broadcast link = https://iplayer.is/beta/<token>
+#
+set -o pipefail
+
+version_number="1.5.0"
+
+# --- endpoints / constants (from rdaily.live JS) ----------------------------
+FLASH_BASE="https://1.newsoccers.one/2/x/feed"
+FLASH_FSIGN="SW9D1eZo"
+API_BASE="https://rdaily.live/api/v1/match"
+PLAYER_BASE="https://iplayer.is/beta/"
+# HLS edge servers 403 without an iplayer.is Referer; mpv/curl must send it.
+STREAM_REFERER="https://iplayer.is/"
+UA="Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"
+
+# sport name -> Flashscore sportId (from the SPORTS table in main.js)
+sport_id() {
+    case "$1" in
+        football)          echo 1  ;;
+        tennis)            echo 2  ;;
+        basketball)        echo 3  ;;
+        hockey)            echo 4  ;;
+        american-football|nfl) echo 5 ;;
+        handball)          echo 7  ;;
+        futsal)            echo 11 ;;
+        volleyball)        echo 12 ;;
+        darts)             echo 14 ;;
+        snooker)           echo 15 ;;
+        boxing)            echo 16 ;;
+        mma)               echo 28 ;;
+        motorsport|f1)     echo 31 ;;
+        winter-sports)     echo 37 ;;
+        *)                 echo "" ;;
+    esac
+}
+
+# ---------------------------------------------------------------------------
+# UI helpers
+# ---------------------------------------------------------------------------
+
+detect_menu() {
+    if [ -n "$MENU" ]; then
+        menu_program="$MENU"
+        return
+    fi
+    for prog in fzf rofi dmenu; do
+        if command -v "$prog" >/dev/null 2>&1; then
+            menu_program="$prog"
+            return
+        fi
+    done
+    menu_program="builtin"
+}
+
+# menu PROMPT < choices-on-stdin  ->  prints the chosen line to stdout
+menu() {
+    local prompt="$1"
+    case "$menu_program" in
+        fzf)     fzf --reverse --cycle --prompt "$prompt " ;;
+        rofi)    rofi -sort -dmenu -i -p "$prompt" ;;
+        dmenu)   dmenu -l 20 -p "$prompt" ;;
+        builtin) builtin_menu "$prompt" ;;
+        *)       "$menu_program" ;;
+    esac
+}
+
+builtin_menu() {
+    local prompt="$1"
+    local -a choices=()
+    local line
+    while IFS= read -r line; do
+        [ -n "$line" ] && choices+=("$line")
+    done
+    [ "${#choices[@]}" -eq 0 ] && return 1
+
+    local i=1
+    for line in "${choices[@]}"; do
+        printf '%3d) %s\n' "$i" "$line" >&2
+        i=$((i + 1))
+    done
+
+    local reply
+    printf '%s ' "$prompt" >&2
+    read -r reply </dev/tty || return 1
+    case "$reply" in
+        ''|*[!0-9]*) return 1 ;;
+    esac
+    [ "$reply" -ge 1 ] && [ "$reply" -le "${#choices[@]}" ] || return 1
+    printf '%s\n' "${choices[$((reply - 1))]}"
+}
+
+die() {
+    printf "\033[1;31m%s\033[0m\n" "$*" >&2
+    exit 1
+}
+
+info() {
+    printf "\033[1;34m%s\033[0m\n" "$*" >&2
+}
+
+help_info() {
+    printf "
+    nog-cli %s - rdaily.live match -> broadcast link resolver
+
+    Usage:
+      %s [options] [query]
+
+    Options:
+      -m, --sports NAMES Sport(s) to list, space-separated (default: football).
+                         Consumes all following non-option words, e.g.
+                           -m basketball football f1
+                         Known: football tennis basketball hockey nfl handball
+                         futsal volleyball darts snooker boxing mma motorsport
+                         (alias f1) winter-sports
+                         (-s/--sport are accepted as aliases of -m)
+      -d, --day N        Day offset from today (0 = today, 1 = tomorrow, -1 = yesterday)
+      -w, --window SECS  Only show matches that are live or kick off within SECS
+                         seconds (default: 3600 = 1 hour). Finished matches are
+                         always hidden.
+      -a, --all          Show all matches for the day (same as -w 0)
+      -F, --no-fuzzy     Use plain substring matching instead of fuzzy
+      -p, --play         Resolve to the direct HLS stream and play it (DEFAULT)
+      -u, --url          Don't play; just print the direct .m3u8 stream URL
+          --player P     Force player backend: mpv, vlc, or a command that
+                         reads MPEG-TS from stdin (default: auto; VLC on WSL)
+      -o, --open         Open the iplayer.is player page in \$BROWSER / xdg-open
+      -l, --list         Just list matches, don't resolve a broadcast link
+      -v, --version      Show version
+      -h, --help         Show this help
+
+    By default nog-cli plays the chosen match's broadcast stream (same as the
+    old -p). The streams are PNG-obfuscated (each TS segment is wrapped in a fake
+    PNG), so a plain player can't open the URL directly -- playback de-wraps on
+    the fly and pipes clean MPEG-TS into the player. Use -u/--url to skip playback
+    and just print the .m3u8 URL instead.
+
+    On WSL, hardware video is software-only (WSLg), which stutters on HD; so if
+    Windows VLC is installed (C:\\Program Files\\VideoLAN\\VLC\\vlc.exe), -p uses
+    it automatically for GPU-accelerated playback. Override with --player mpv.
+
+    Player tuning env vars:
+      NOG_PLAYER   Default backend (mpv | vlc | custom command)
+      NOG_MPV_ARGS Extra args appended to the mpv command
+      NOG_VLC_ARGS Extra args appended to the vlc command
+
+    By default nog-cli shows only matches that are live right now or starting
+    within the next hour. Live matches are tagged [LIVE]; with multiple sports
+    each title is prefixed with [SPORT].
+
+    Environment:
+      MENU     Force a menu program (fzf, rofi, dmenu, or any command)
+      BROWSER  Browser command used by --open
+
+    Examples:
+      %s                           # today's live/within-1hr football -> plays it
+      %s nasaf                     # fuzzy 'nasaf', play it
+      %s -u nasaf                  # print the m3u8 URL instead of playing
+      %s -m basketball football f1 # several sports at once
+      %s -s tennis -d 1 -a         # all of tomorrow's tennis
+    \n" "$version_number" "${0##*/}" "${0##*/}" "${0##*/}" "${0##*/}" "${0##*/}"
+    exit 0
+}
+
+version_info() {
+    printf "%s\n" "$version_number"
+    exit 0
+}
+
+# ---------------------------------------------------------------------------
+# Fuzzy / substring filtering
+# ---------------------------------------------------------------------------
+
+# subsequence match: every char of query appears in text in order (ci)
+is_fuzzy_match() {
+    local query="${1,,}" text="${2,,}"
+    local qi=0 ti=0 qlen tlen
+    qlen=${#query}; tlen=${#text}
+    [ "$qlen" -eq 0 ] && return 0
+    while [ "$qi" -lt "$qlen" ] && [ "$ti" -lt "$tlen" ]; do
+        [ "${query:$qi:1}" = "${text:$ti:1}" ] && qi=$((qi + 1))
+        ti=$((ti + 1))
+    done
+    [ "$qi" -eq "$qlen" ]
+}
+
+# filter stdin lines by query; keeps the "TITLE\tMETA" structure intact
+filter_matches() {
+    local query="$1" mode="$2" line title lower
+    while IFS= read -r line; do
+        [ -z "$line" ] && continue
+        title="${line%%$'\t'*}"
+        if [ "$mode" = "fuzzy" ]; then
+            is_fuzzy_match "$query" "$title" && printf '%s\n' "$line"
+        else
+            lower="${title,,}"
+            case "$lower" in *"${query,,}"*) printf '%s\n' "$line" ;; esac
+        fi
+    done
+}
+
+# ---------------------------------------------------------------------------
+# Stage 1: fetch + parse the match feed
+# ---------------------------------------------------------------------------
+
+# Emits one line per kept event: "<title>\t<sport>\t<eventId>"
+# Args: <sportId> <dayOffset> <windowSecs> <sportLabel>
+fetch_matches() {
+    local sid="$1" day="$2" window="$3" label="$4" url text
+    url="${FLASH_BASE}/f_${sid}_${day}_1_en_1"
+    text=$(curl -fsSL "$url") || die "Failed to fetch match feed ($url)"
+
+    # Records are '~'-separated; fields within a record are '¬'-separated,
+    # and each field is "KEY÷VALUE". AB is the status: 1=scheduled, 2=live,
+    # 3=finished. Keep live matches plus scheduled ones kicking off within
+    # $window seconds (0 or negative window = keep everything not finished).
+    printf '%s' "$text" | awk -v now="$(date +%s)" -v window="$window" -v sport="$label" '
+        BEGIN { RS="~"; FS="¬" }
+        {
+            id=""; home=""; away=""; ts=""; st=""
+            for (i = 1; i <= NF; i++) {
+                split($i, a, "÷")
+                if      (a[1] == "AA") id   = a[2]
+                else if (a[1] == "AE") home = a[2]
+                else if (a[1] == "AF") away = a[2]
+                else if (a[1] == "AD") ts   = a[2]
+                else if (a[1] == "AB") st   = a[2]
+            }
+            if (id == "" || home == "" || away == "") next
+
+            keep = 0; tag = ""
+            if (st == "2") { keep = 1; tag = "LIVE" }
+            else if (st == "1") {
+                if (window <= 0) { keep = 1 }
+                else if (ts ~ /^[0-9]+$/) {
+                    d = ts - now
+                    if (d <= window && d >= -0) keep = 1
+                }
+            }
+            # st == "3" (finished) is always dropped
+            if (!keep) next
+
+            tm = (ts ~ /^[0-9]+$/) ? strftime(" (%H:%M)", ts+0) : ""
+            prefix = (tag == "LIVE") ? "[LIVE] " : ""
+            # Column 1 = display title, 2 = sport, 3 = event id
+            printf "%s%s vs %s%s\t%s\t%s\n", prefix, home, away, tm, sport, id
+        }
+    '
+}
+
+# ---------------------------------------------------------------------------
+# Stage 2: resolve broadcast token(s) -> iplayer.is links
+# ---------------------------------------------------------------------------
+
+# Emits one line per stream:  "<name>\t<iplayer url>"
+resolve_broadcast() {
+    local event_id="$1" json
+    json=$(curl -fsSL "${API_BASE}/FS:${event_id}") || return 1
+    [ -z "$json" ] && return 1
+
+    # Parse custom_urls[] without a JSON lib: put each "{...}" object on its
+    # own line, then pull enabled {name,url} pairs whose url is a 32-hex
+    # broadcast token. The `|| [ -n "$obj" ]` guard ensures the final object
+    # is processed even when the stream has no trailing newline.
+    printf '%s' "$json" \
+        | sed 's/{/\n{/g' \
+        | while IFS= read -r obj || [ -n "$obj" ]; do
+            case "$obj" in
+                *'"url"'*)
+                    url=$(printf '%s' "$obj" | sed -nE 's/.*"url"[[:space:]]*:[[:space:]]*"([a-f0-9]{32})".*/\1/p')
+                    [ -z "$url" ] && continue
+                    name=$(printf '%s' "$obj" | sed -nE 's/.*"name"[[:space:]]*:[[:space:]]*"([^"]*)".*/\1/p')
+                    enabled=$(printf '%s' "$obj" | sed -nE 's/.*"enabled"[[:space:]]*:[[:space:]]*(true|false).*/\1/p')
+                    [ "$enabled" = "false" ] && continue
+                    [ -z "$name" ] && name="stream"
+                    printf '%s\t%s%s\n' "$name" "$PLAYER_BASE" "$url"
+                    ;;
+            esac
+        done
+}
+
+# Given an iplayer.is player-page URL (or raw token), return the direct HLS
+# (.m3u8) stream URL that the page's JWPlayer actually loads.
+#   1. Fetch the player page and scrape its `var STREAM_URL = "..."`.
+#   2. Fall back to the known pattern https://netanjahu.hls.st/t/<token>/index.m3u8
+extract_stream() {
+    local page_url="$1" token html stream
+    # Derive the 32-hex token whether we were handed a full URL or just a token.
+    token=$(printf '%s' "$page_url" | grep -oE '[a-f0-9]{32}' | head -n1)
+
+    html=$(curl -fsSL -A "$UA" -H "Referer: ${API_BASE%/api*}/" "${PLAYER_BASE}${token}") || html=""
+    if [ -n "$html" ]; then
+        stream=$(printf '%s' "$html" \
+            | grep -oE 'STREAM_URL[^"]*"[^"]+"' \
+            | head -n1 \
+            | sed -E 's/.*"([^"]+)".*/\1/; s#\\/#/#g')
+    fi
+
+    # Fallback to the documented host pattern if scraping failed.
+    if [ -z "$stream" ] && [ -n "$token" ]; then
+        stream="https://netanjahu.hls.st/t/${token}/index.m3u8"
+    fi
+
+    [ -z "$stream" ] && return 1
+    printf '%s\n' "$stream"
+}
+
+# Play a (possibly PNG-wrapped) HLS stream (backend auto-selected).
+#
+# iplayer.is streams disguise each MPEG-TS segment as a tiny PNG: the file is a
+# valid PNG (IHDR/IDAT/IEND) immediately followed by the real .ts payload. mpv
+# can't strip that, so we run a small live downloader that polls the playlist,
+# strips the PNG wrapper from each new segment, and pipes clean TS into mpv.
+#
+# Args: <m3u8-url> <title>
+play_stream() {
+    local url="$1" title="$2"
+    command -v python3 >/dev/null 2>&1 || die "python3 is required for stream de-obfuscation"
+
+    # Choose a player backend. On WSL, software GL (WSLg) makes the Linux mpv
+    # stutter on HD; Windows VLC uses the real GPU via D3D11VA, so prefer it.
+    local backend="$NOG_PLAYER"
+    if [ -z "$backend" ]; then
+        if is_wsl && [ -n "$(find_win_vlc)" ]; then
+            backend="vlc"
+        else
+            backend="mpv"
+        fi
+    fi
+
+    # The de-PNG streamer writes a clean MPEG-TS byte stream to stdout; we pipe
+    # that into the selected player reading from stdin.
+    case "$backend" in
+        vlc)
+            local vlc; vlc="$(find_win_vlc)"
+            [ -z "$vlc" ] && vlc="$(command -v vlc || command -v cvlc)"
+            [ -z "$vlc" ] && die "VLC not found (set NOG_PLAYER=mpv or install VLC)"
+            info "Backend: VLC ($vlc)"
+            stream_ts "$url" | "$vlc" ${NOG_VLC_ARGS:-} --meta-title "$title" - ;;
+        mpv)
+            command -v mpv >/dev/null 2>&1 || die "mpv is not installed (set NOG_PLAYER=vlc or install mpv)"
+            info "Backend: mpv"
+            stream_ts "$url" | mpv --force-media-title="$title" \
+                --cache=yes --cache-secs=30 \
+                --demuxer-max-bytes=100MiB --demuxer-max-back-bytes=50MiB \
+                --demuxer-readahead-secs=20 \
+                --framedrop=vo --vd-lavc-fast \
+                --keep-open=no --msg-level=vo=error \
+                ${NOG_MPV_ARGS:-} - ;;
+        *)
+            # Treat NOG_PLAYER as an explicit command that reads TS from stdin.
+            info "Backend: $backend"
+            stream_ts "$url" | $backend - ;;
+    esac
+}
+
+# Are we running under WSL?
+is_wsl() {
+    grep -qi microsoft /proc/version 2>/dev/null
+}
+
+# Locate a Windows VLC install reachable from WSL; echoes the path or nothing.
+find_win_vlc() {
+    local p
+    for p in \
+        "/mnt/c/Program Files/VideoLAN/VLC/vlc.exe" \
+        "/mnt/c/Program Files (x86)/VideoLAN/VLC/vlc.exe"; do
+        [ -f "$p" ] && { printf '%s\n' "$p"; return 0; }
+    done
+    return 1
+}
+
+# De-obfuscate the (PNG-wrapped) live HLS stream and emit clean MPEG-TS on stdout.
+# Args: <m3u8-url>
+stream_ts() {
+    STREAM_URL="$1" STREAM_REFERER="$STREAM_REFERER" STREAM_UA="$UA" \
+    python3 - <<'PY'
+import os, sys, time, struct, urllib.request, urllib.parse
+
+URL     = os.environ["STREAM_URL"]
+REFERER = os.environ.get("STREAM_REFERER", "")
+UA      = os.environ.get("STREAM_UA", "Mozilla/5.0")
+HEADERS = {"User-Agent": UA, "Referer": REFERER, "Origin": REFERER.rstrip("/")}
+
+def fetch(u, timeout=15):
+    req = urllib.request.Request(u, headers=HEADERS)
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return r.read()
+
+def strip_png(b):
+    # If it's a PNG, skip chunks up to and including IEND; return the rest (TS).
+    if not b.startswith(b"\x89PNG\r\n\x1a\n"):
+        return b
+    i = 8
+    while i + 8 <= len(b):
+        ln  = struct.unpack(">I", b[i:i+4])[0]
+        typ = b[i+4:i+8]
+        i  += 12 + ln
+        if typ == b"IEND":
+            return b[i:]
+    return b
+
+def parse_playlist(txt, base):
+    segs = []
+    for line in txt.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        segs.append(urllib.parse.urljoin(base, line))
+    return segs
+
+out  = sys.stdout.buffer
+seen = set()
+order = []       # bounded dedup history
+
+def run():
+    while True:
+        try:
+            pl = fetch(URL).decode("utf-8", "replace")
+        except Exception:
+            time.sleep(2); continue
+        for seg in parse_playlist(pl, URL):
+            if seg in seen:
+                continue
+            seen.add(seg); order.append(seg)
+            if len(order) > 2000:
+                seen.discard(order.pop(0))
+            try:
+                out.write(strip_png(fetch(seg))); out.flush()
+            except BrokenPipeError:
+                return                      # player closed -> stop
+            except Exception:
+                continue
+        time.sleep(3)                       # live playlist refresh interval
+
+try:
+    run()
+except (KeyboardInterrupt, BrokenPipeError):
+    pass
+PY
+}
+
+# ---------------------------------------------------------------------------
+# Argument parsing
+# ---------------------------------------------------------------------------
+
+sports=""           # space-separated list; empty -> default football
+day="0"
+query=""
+mode="fuzzy"
+open_link=false
+play=true           # play by default; -u/--url prints the raw stream URL instead
+list_only=false
+window=3600         # seconds: live + kicking off within this window (0 = all)
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        -m|--sports|-s|--sport)
+            # Consume all following non-option tokens as sport names.
+            shift
+            while [ $# -gt 0 ] && [ "${1#-}" = "$1" ]; do
+                sports="${sports:+$sports }$1"
+                shift
+            done
+            ;;
+        -d|--day)      day="$2"; shift 2 ;;
+        -w|--window)   window="$2"; shift 2 ;;
+        -a|--all)      window=0; shift ;;
+        -F|--no-fuzzy) mode="substring"; shift ;;
+        -o|--open)     open_link=true; play=false; shift ;;
+        -p|--play)     play=true; shift ;;
+        -u|--url|--print) play=false; shift ;;
+        --player)      NOG_PLAYER="$2"; shift 2 ;;
+        -l|--list)     list_only=true; shift ;;
+        -v|--version)  version_info ;;
+        -h|--help)     help_info ;;
+        --)            shift; query="$*"; break ;;
+        -*)            die "Unknown option: $1" ;;
+        *)             query="${query:+$query }$1"; shift ;;
+    esac
+done
+
+[ -z "$sports" ] && sports="football"
+
+case "$window" in ''|*[!0-9]*) die "Window must be a non-negative integer number of seconds (got: $window)";; esac
+case "$day" in ''|*[!0-9-]*) die "Day offset must be an integer (got: $day)";; esac
+
+# Validate every requested sport up front.
+for sp in $sports; do
+    [ -z "$(sport_id "$sp")" ] && die "Unknown sport: $sp (see --help for the list)"
+done
+
+# Count how many distinct sports were requested (controls display prefix).
+sport_total=$(printf '%s\n' $sports | grep -c .)
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+detect_menu
+
+if [ "$window" -eq 0 ]; then
+    info "Fetching matches: $sports (day offset $day, all times)..."
+else
+    info "Fetching matches: $sports (day offset $day, live or within $((window / 60))min)..."
+fi
+
+# Fetch each requested sport and tag the display title with the sport name
+# when more than one sport is requested.
+all=""
+for sp in $sports; do
+    sid=$(sport_id "$sp")
+    rows=$(fetch_matches "$sid" "$day" "$window" "$sp")
+    [ -z "$rows" ] && continue
+    if [ "$sport_total" -gt 1 ]; then
+        # Prefix the title column (col 1) with the uppercased sport name.
+        up=$(printf '%s' "$sp" | tr '[:lower:]' '[:upper:]')
+        rows=$(printf '%s\n' "$rows" | awk -F'\t' -v s="$up" 'NF>=3{printf "[%s] %s\t%s\t%s\n", s, $1, $2, $3}')
+    fi
+    all="${all:+$all$'\n'}$rows"
+done
+
+if [ -z "$all" ]; then
+    if [ "$window" -eq 0 ]; then
+        die "No matches found for: $sports (day $day)"
+    else
+        die "No live or upcoming matches for: $sports (within $((window / 60))min). Try -w 0 to list everything, or -d 1 for tomorrow."
+    fi
+fi
+
+# Filter by query if provided.
+if [ -n "$query" ]; then
+    matches=$(printf '%s\n' "$all" | filter_matches "$query" "$mode")
+else
+    matches=$(printf '%s\n' "$all")
+fi
+[ -z "$matches" ] && die "No matches matched: $query"
+
+# List-only mode: print titles and exit.
+if [ "$list_only" = true ]; then
+    printf '%s\n' "$matches" | cut -f1
+    exit 0
+fi
+
+# If exactly one match remains, auto-select it; otherwise show the menu.
+match_count=$(printf '%s\n' "$matches" | grep -c .)
+if [ "$match_count" -eq 1 ]; then
+    chosen="$matches"
+else
+    chosen=$(printf '%s\n' "$matches" | cut -f1 \
+        | menu "Select a match:")
+    [ -z "$chosen" ] && die "No selection made"
+    # Map the chosen title back to its full "title\tid" line.
+    chosen=$(printf '%s\n' "$matches" | awk -F'\t' -v t="$chosen" '$1==t{print; exit}')
+fi
+
+[ -z "$chosen" ] && die "Could not resolve selection"
+
+event_id="${chosen##*$'\t'}"
+title="${chosen%%$'\t'*}"
+info "Resolving broadcast for: $title  [FS:$event_id]"
+
+streams=$(resolve_broadcast "$event_id")
+if [ -z "$streams" ]; then
+    die "No broadcast links available for this match yet (links appear ~10 min before kickoff)."
+fi
+
+# Single stream -> use it; multiple -> let the user pick.
+stream_count=$(printf '%s\n' "$streams" | grep -c .)
+if [ "$stream_count" -eq 1 ]; then
+    picked="$streams"
+else
+    sel=$(printf '%s\n' "$streams" | cut -f1 | menu "Select a stream:")
+    [ -z "$sel" ] && die "No stream selected"
+    picked=$(printf '%s\n' "$streams" | awk -F'\t' -v t="$sel" '$1==t{print; exit}')
+fi
+
+stream_url="${picked##*$'\t'}"
+stream_name="${picked%%$'\t'*}"
+
+# --open just launches the iplayer.is player page in a browser (JWPlayer there
+# handles the stream + required headers itself).
+if [ "$open_link" = true ]; then
+    info "Opening $stream_name -> $stream_url"
+    "${BROWSER:-xdg-open}" "$stream_url" >/dev/null 2>&1 &
+    exit 0
+fi
+
+# Otherwise resolve the player page down to a direct HLS (.m3u8) URL.
+media_url=$(extract_stream "$stream_url") \
+    || die "Could not extract a playable stream from $stream_url"
+
+if [ "$play" = true ]; then
+    info "Playing: $stream_name"
+    play_stream "$media_url" "$stream_name"
+    exit $?
+fi
+
+# -u/--url: print the direct stream URL instead of playing. Note the stream is
+# PNG-wrapped, so plain `mpv <url>` won't work -- drop -u to let nog-cli play it.
+printf '%s\n' "$media_url"
+info "This stream is PNG-obfuscated; play it with:  ${0##*/} \"$query\""
+info "(a plain player can't open the URL directly without de-wrapping)"
